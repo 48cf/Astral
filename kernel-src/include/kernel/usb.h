@@ -1,0 +1,300 @@
+#ifndef _USB_H
+#define _USB_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <list.h>
+
+typedef struct usb_hub_port usb_hub_port_t;
+typedef struct usb_hub usb_hub_t;
+typedef struct usb_device usb_device_t;
+typedef struct usb_endpoint usb_endpoint_t;
+typedef struct usb_xfer usb_xfer_t;
+typedef struct usb_ctrl usb_ctrl_t;
+typedef struct usb_class_driver usb_class_driver_t;
+
+#define USB_DESCRIPTOR_TYPE_DEVICE 1
+#define USB_DESCRIPTOR_TYPE_CONFIG 2
+#define USB_DESCRIPTOR_TYPE_STRING 3
+#define USB_DESCRIPTOR_TYPE_INTERFACE 4
+#define USB_DESCRIPTOR_TYPE_ENDPOINT 5
+
+typedef struct {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+} usb_desc_hdr_t;
+
+typedef struct {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint16_t bcdUSB;
+	uint8_t bDeviceClass;
+	uint8_t bDeviceSubClass;
+	uint8_t bDeviceProtocol;
+	uint8_t bMaxPacketSize0;
+	uint16_t idVendor;
+	uint16_t idProduct;
+	uint16_t bcdDevice;
+	uint8_t iManufacturer;
+	uint8_t iProduct;
+	uint8_t iSerialNumber;
+	uint8_t bNumConfigurations;
+} __attribute__((packed)) usb_device_desc_t;
+
+typedef struct {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint16_t wTotalLength;
+	uint8_t bNumInterfaces;
+	uint8_t bConfigurationValue;
+	uint8_t iConfiguration;
+	uint8_t bmAttributes;
+	uint8_t bMaxPower;
+} __attribute__((packed)) usb_config_desc_t;
+
+typedef struct {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bInterfaceNumber;
+	uint8_t bAlternateSetting;
+	uint8_t bNumEndpoints;
+	uint8_t bInterfaceClass;
+	uint8_t bInterfaceSubClass;
+	uint8_t bInterfaceProtocol;
+	uint8_t iInterface;
+} __attribute__((packed)) usb_interface_desc_t;
+
+#define USB_ENDPOINT_ADDRESS_NUM_MASK 0x0f
+#define USB_ENDPOINT_ADDRESS_DIR_IN 0x80
+
+#define USB_ENDPOINT_ATTRIB_TYPE_MASK 0x03
+#define USB_ENDPOINT_ATTRIB_TYPE_CONTROL 0x00
+#define USB_ENDPOINT_ATTRIB_TYPE_ISOCH 0x01
+#define USB_ENDPOINT_ATTRIB_TYPE_BULK 0x02
+#define USB_ENDPOINT_ATTRIB_TYPE_INTR 0x03
+
+typedef struct {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bEndpointAddress;
+	uint8_t bmAttributes;
+	uint16_t wMaxPacketSize;
+	uint8_t bInterval;
+} __attribute__((packed)) usb_endpoint_desc_t;
+
+#define USB_REQUEST_RECIP_DEVICE 0x00
+#define USB_REQUEST_RECIP_INTERFACE 0x01
+#define USB_REQUEST_RECIP_ENDPOINT 0x02
+#define USB_REQUEST_RECIP_OTHER 0x03
+
+#define USB_REQUEST_STANDARD 0x00
+#define USB_REQUEST_CLASS 0x20
+#define USB_REQUEST_VENDOR 0x40
+
+#define USB_REQUEST_DIR_TO_DEVICE 0x00
+#define USB_REQUEST_DIR_TO_HOST 0x80
+
+#define USB_REQUEST_GET_DESCRIPTOR 6
+#define USB_REQUEST_SET_CONFIGURATION 9
+#define USB_REQUEST_SET_INTERFACE 11
+
+typedef struct {
+	uint8_t bmRequestType;
+	uint8_t bRequest;
+	uint16_t wValue;
+	uint16_t wIndex;
+	uint16_t wLength;
+} __attribute__((packed)) usb_setup_t;
+
+typedef enum {
+	USB_HUB_PORT_DISCONNECTED,
+	USB_HUB_PORT_RESETTING,
+	USB_HUB_PORT_ENABLED,
+} usb_hub_port_status_t;
+
+struct usb_hub_port {
+	usb_hub_port_status_t status;
+	usb_device_t *device;
+};
+
+#define USB_HUB_PORT_STATUS_PORT_CONNECTION (1 << 0)
+#define USB_HUB_PORT_STATUS_PORT_ENABLE (1 << 1)
+#define USB_HUB_PORT_STATUS_PORT_OVER_CURRENT (1 << 3)
+#define USB_HUB_PORT_STATUS_PORT_RESET (1 << 4)
+#define USB_HUB_PORT_STATUS_PORT_POWER (1 << 8)
+#define USB_HUB_PORT_STATUS_LOW_SPEED (1 << 9)
+#define USB_HUB_PORT_STATUS_HIGH_SPEED (1 << 10)
+
+#define USB_HUB_PORT_CHANGE_PORT_CONNECTION (1 << 0)
+#define USB_HUB_PORT_CHANGE_PORT_ENABLE (1 << 1)
+#define USB_HUB_PORT_CHANGE_PORT_OVER_CURRENT (1 << 3)
+#define USB_HUB_PORT_CHANGE_PORT_RESET (1 << 4)
+
+#define USB_HUB_FEATURE_PORT_CONNECTION 0
+#define USB_HUB_FEATURE_PORT_ENABLE 1
+#define USB_HUB_FEATURE_PORT_RESET 4
+#define USB_HUB_FEATURE_PORT_POWER 8
+#define USB_HUB_FEATURE_PORT_LOW_SPEED 9
+#define USB_HUB_FEATURE_C_PORT_CONNECTION 16
+#define USB_HUB_FEATURE_C_PORT_ENABLE 17
+#define USB_HUB_FEATURE_C_PORT_RESET 20
+
+typedef struct {
+	int (*reset_port)(usb_hub_t *, uint8_t port);
+	int (*get_port_status)(usb_hub_t *, uint8_t port, uint16_t *status, uint16_t *change);
+	int (*set_port_feature)(usb_hub_t *, uint8_t port, uint16_t feature);
+	int (*clear_port_feature)(usb_hub_t *, uint8_t port, uint16_t feature);
+} usb_hub_ops_t;
+
+struct usb_hub {
+	char name[32];
+
+	// List node for linking hubs in the controller's hub list.
+	list_node_t node;
+	// Controller the hub is connected to.
+	usb_ctrl_t *ctrl;
+	// Operations for managing the hub.
+	usb_hub_ops_t *ops;
+	// Pointer to the device representing the hub itself.
+	// NULL if the hub is a root hub.
+	usb_device_t *device;
+	// Array of ports on the hub.
+	// Each port can have a pointer to the connected device.
+	usb_hub_port_t *ports;
+	uint32_t port_count;
+};
+
+struct usb_endpoint {
+	usb_endpoint_desc_t desc;
+};
+
+typedef enum {
+	USB_SPEED_LOW,
+	USB_SPEED_FULL,
+	USB_SPEED_HIGH,
+	USB_SPEED_SUPER,
+	USB_SPEED_SUPER_PLUS,
+} usb_speed_t;
+
+struct usb_device {
+	// Pointer to the parent hub.
+	usb_hub_t *hub;
+	// Maximum packet size for endpoint 0.
+	uint16_t max_packet_size0;
+	// Port number on the parent hub.
+	uint8_t port_number;
+	// Read only USB address assigned to the device.
+	uint8_t address;
+	// Device speed.
+	usb_speed_t speed;
+	// Pointer to the attached class driver (for cleanup on disconnect).
+	usb_class_driver_t *driver;
+	// Private data for the attached class driver.
+	void *driver_data;
+};
+
+typedef enum {
+	USB_TRANSFER_TO_DEVICE,
+	USB_TRANSFER_TO_HOST,
+} usb_xfer_dir_t;
+
+typedef enum {
+	USB_TRANSFER_CONTROL,
+	USB_TRANSFER_BULK,
+	USB_TRANSFER_INTERRUPT,
+} usb_xfer_type_t;
+
+typedef enum {
+	USB_STATUS_SUCCESS,
+	USB_STATUS_ERROR,
+	USB_STATUS_TIMEOUT,
+	USB_STATUS_STALL,
+} usb_status_t;
+
+// Represents a USB control or data transfer.
+struct usb_xfer {
+	// Target endpoint for the transfer.
+	// Should be NULL and will be ignored for control transfers.
+	usb_endpoint_t *ep;
+
+	// Direction and type of the transfer.
+	usb_xfer_dir_t dir;
+	usb_xfer_type_t type;
+
+	// Only valid for control transfers.
+	usb_setup_t *setup;
+
+	// Buffer for the transfer.
+	void *buffer;
+	uint32_t length;
+
+	// Optional asynchronous completion callback.
+	void (*completion)(usb_xfer_t *, usb_status_t status, uint32_t transferred);
+	void *completion_ctx;
+};
+
+typedef struct {
+	// Initialize the USB controller.
+	int (*start)(usb_ctrl_t *);
+	// Re-enumerate all devices on all hubs.
+	int (*enumerate)(usb_ctrl_t *);
+	// Allocate, enable and address a USB device.
+	int (*address_device)(usb_ctrl_t *, usb_hub_t *, uint8_t port, usb_device_t **);
+	// Configure an endpoint.
+	int (*configure_ep)(usb_ctrl_t *, usb_device_t *, usb_endpoint_t *);
+	// Execute a control or data transfer.
+	int (*xfer)(usb_ctrl_t *, usb_device_t *, usb_xfer_t *);
+} usb_ctrl_ops_t;
+
+struct usb_ctrl {
+	usb_ctrl_ops_t *ops;
+	list_t hubs;
+};
+
+int usb_hub_start(usb_hub_t *hub);
+int usb_hub_enumerate(usb_hub_t *hub);
+int usb_hub_enumerate_port(usb_hub_t *hub, uint8_t port);
+
+int usb_submit_xfer(usb_device_t *dev, usb_xfer_t *xfer);
+int usb_configure_endpoint(usb_device_t *dev, usb_endpoint_t *ep);
+int usb_get_descriptor(usb_device_t *dev, uint8_t desc_type, uint8_t desc_index, void *buffer, uint16_t length);
+int usb_set_configuration(usb_device_t *dev, uint8_t config_value);
+int usb_set_interface(usb_device_t *dev, uint8_t interface_number, uint8_t alt_setting);
+
+#define USB_DRIVER_SCORE_NONE 0
+#define USB_DRIVER_SCORE_GENERIC 10
+#define USB_DRIVER_SCORE_CLASS_MATCH 30
+#define USB_DRIVER_SCORE_SUBCLASS_MATCH 50
+#define USB_DRIVER_SCORE_PROTOCOL_MATCH 60
+#define USB_DRIVER_SCORE_VENDOR_MATCH 80
+#define USB_DRIVER_SCORE_PRODUCT_MATCH 90
+#define USB_DRIVER_SCORE_EXACT_MATCH 100
+
+typedef struct {
+	usb_device_t *device;
+	usb_device_desc_t *device_desc;
+	usb_config_desc_t *config_desc;
+} usb_probe_ctx_t;
+
+#define usb_for_each_descriptor(desc, item) \
+	for (usb_desc_hdr_t *item = (usb_desc_hdr_t *)((void *)(desc) + desc->bLength); \
+		(void *)item < (void *)(desc) + (desc)->wTotalLength; \
+		item = (usb_desc_hdr_t *)((void *)item + item->bLength))
+
+struct usb_class_driver {
+	const char *name;
+	// List node for driver registry.
+	list_node_t node;
+	// Probe function, returns score - (0 = won't handle, higher = better match).
+	int (*probe)(usb_probe_ctx_t *ctx);
+	// Called when this driver is selected for the device.
+	// Should configure endpoints and initialize the device.
+	int (*attach)(usb_device_t *dev, usb_probe_ctx_t *ctx, void **driver_data);
+	// Called when device is disconnected.
+	void (*detach)(usb_device_t *dev, void *driver_data);
+};
+
+void usb_register_class_driver(usb_class_driver_t *driver);
+
+#endif
