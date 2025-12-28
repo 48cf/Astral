@@ -268,6 +268,8 @@ void arch_cpu_init() {
 	ist1 += PAGE_SIZE * 4 / sizeof(uint64_t) - 2;
 	*ist1 = (uint64_t)current_cpu();
 	current_cpu()->ist.ist1 = (uint64_t)ist1;
+
+	dpc_prepare(&current_cpu()->reschedule_dpc, sched_reschedule_dpc);
 }
 
 INIT_ROUTINE_DEFINE(cpu, INIT_ROUTINE_FLAGS_NONE, arch_cpu_init, acpi_early);

@@ -56,6 +56,7 @@ void sched_thread_wakeup_callback(thread_t *thread);
 
 thread_t *sched_select_next_thread(void);
 void sched_insert_in_cpu_queue(struct cpu_t *cpu, thread_t *thread);
+void sched_reschedule_dpc(context_t *context, dpcarg_t arg);
 void sched_preempt_cpu(struct cpu_t *cpu);
 thread_t *sched_steal_work_from_cpu(struct cpu_t *cpu);
 

@@ -230,7 +230,7 @@ static void dopreempt() {
 	switch_thread(next);
 }
 
-static void preempt_dpc(context_t *context, dpcarg_t arg) {
+void sched_reschedule_dpc(context_t *context, dpcarg_t arg) {
 	thread_t* current = current_thread();
 	interrupt_set(false);
 
@@ -250,18 +250,18 @@ static void preempt_dpc(context_t *context, dpcarg_t arg) {
 
 // IPL_DPC
 static void reschedule_timer_dpc(context_t *context, dpcarg_t arg) {
-	dpc_enqueue(&current_cpu()->reschedule_dpc, preempt_dpc, NULL);
+	dpc_enqueue(&current_cpu()->reschedule_dpc, NULL);
 }
 
 // IPL_MAX
 static void reschedule_ipi(isr_t *, context_t *) {
-	dpc_enqueue(&current_cpu()->reschedule_dpc, preempt_dpc, NULL);
+	dpc_enqueue(&current_cpu()->reschedule_dpc, NULL);
 }
 
 void sched_preempt_cpu(cpu_t *cpu) {
 	long ipl = interrupt_raiseipl(IPL_DPC);
 	if (cpu == current_cpu()) {
-		dpc_enqueue(&cpu->reschedule_dpc, preempt_dpc, NULL);
+		dpc_enqueue(&cpu->reschedule_dpc, NULL);
 	} else {
 		arch_smp_send_ipi(cpu, cpu->reschedule_isr, ARCH_SMP_IPI_TARGET, false);
 	}
