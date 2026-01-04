@@ -3,7 +3,8 @@
 #include <kernel/usb.h>
 #include <logging.h>
 
-static list_t usb_class_drivers = LIST_INIT_VALUE;
+extern usb_class_driver_t *usb_class_drivers;
+extern usb_class_driver_t *usb_class_drivers_end;
 
 static int usb_probe_device(usb_device_t *dev) {
 	int res;
@@ -44,8 +45,8 @@ static int usb_probe_device(usb_device_t *dev) {
 		ctx.device_desc = &dev_desc;
 		ctx.config_desc = config_descs[i];
 
-		list_for_each(&usb_class_drivers, node) {
-			usb_class_driver_t *driver = container_of(node, usb_class_driver_t, node);
+		for (usb_class_driver_t **it = &usb_class_drivers; it < &usb_class_drivers_end; ++it) {
+			usb_class_driver_t *driver = *it;
 			int score = driver->probe(&ctx);
 
 			if (score > best_score) {
@@ -259,9 +260,4 @@ int usb_set_interface(usb_device_t *dev, uint8_t interface_number, uint8_t alt_s
 	xfer.completion = NULL;
 
 	return usb_submit_xfer(dev, &xfer);
-}
-
-void usb_register_class_driver(usb_class_driver_t *driver) {
-	printf("usb: registering class driver '%s'\n", driver->name);
-	list_push_back(&usb_class_drivers, &driver->node);
 }

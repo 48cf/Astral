@@ -284,8 +284,6 @@ typedef struct {
 
 struct usb_class_driver {
 	const char *name;
-	// List node for driver registry.
-	list_node_t node;
 	// Probe function, returns score - (0 = won't handle, higher = better match).
 	int (*probe)(usb_probe_ctx_t *ctx);
 	// Called when this driver is selected for the device.
@@ -295,6 +293,10 @@ struct usb_class_driver {
 	void (*detach)(usb_device_t *dev, void *driver_data);
 };
 
-void usb_register_class_driver(usb_class_driver_t *driver);
+#define DEFINE_USB_CLASS_DRIVER(name, ...) \
+	static usb_class_driver_t __usb_class_driver_##name = { \
+		__VA_ARGS__ \
+	}; \
+	__attribute__((section(".usb_class_drivers"), used)) static usb_class_driver_t *usb_class_driver_##name = &__usb_class_driver_##name;
 
 #endif

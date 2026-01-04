@@ -360,15 +360,9 @@ static void usb_hid_detach(usb_device_t *dev, void *driver_data) {
 	_panic("usb_hid_detach: not implemented yet", NULL);
 }
 
-static usb_class_driver_t usb_hid_driver = {
+DEFINE_USB_CLASS_DRIVER(usb_hid_driver,
 	.name = "usb-hid",
 	.probe = usb_hid_probe,
 	.attach = usb_hid_attach,
-	.detach = usb_hid_detach,
-};
-
-static void usb_hid_init(void) {
-	usb_register_class_driver(&usb_hid_driver);
-}
-
-INIT_ROUTINE_DEFINE(usb_hid, INIT_ROUTINE_FLAGS_NONE, usb_hid_init, acpi);
+	.detach = usb_hid_detach
+)
