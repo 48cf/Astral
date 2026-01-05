@@ -186,6 +186,9 @@ typedef struct {
 #define XHCI_PORTSC_OCC (1 << 20)
 #define XHCI_PORTSC_PRC (1 << 21)
 
+#define XHCI_TRB_DW2_TR_LEN(LEN) (uint32_t)((LEN) & 0xffff)
+#define XHCI_TRB_DW2_TD_SIZE(SIZE) ((uint32_t)((SIZE) & 0x1f) << 17)
+
 #define XHCI_TRB_DW3_C (1 << 0)
 #define XHCI_TRB_DW3_TC (1 << 1)
 #define XHCI_TRB_DW3_ISP (1 << 2)

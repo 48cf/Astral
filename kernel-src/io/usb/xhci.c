@@ -11,30 +11,38 @@
 #include <logging.h>
 #include <util.h>
 
+typedef struct xhci_submission xhci_submission_t;
+typedef struct xhci_device xhci_device_t;
+
 typedef struct {
 	uint8_t ver_major;
 	uint8_t ver_minor;
 } xhci_port_protocol_t;
 
-typedef struct xhci_submission {
-	list_node_t node;
-	xhci_trb_t *trb;
-
-	// Filled in right before the callback is invoked.
-	xhci_trb_t event_trb;
-	xhci_trb_t associated_trb;
+struct xhci_submission {
+	bool valid;
 
 	// The callback to invoke.
 	void (*completion)(struct xhci_submission *);
 	void *completion_ctx;
-} xhci_submission_t;
+
+	// Filled in right before the completion callback is invoked.
+	xhci_trb_t event_trb;
+	xhci_trb_t cmd_trb;
+};
 
 typedef struct {
 	void *ring_phys;
 	xhci_trb_t *ring;
 
-	// Back pointer to the controller.
+	// Lock to protect the ring structure.
+	spinlock_t lock;
+
+	// Back-pointer to the controller.
 	struct xhci_ctrl *ctrl;
+
+	// List of submissions on this ring. Will be NULL for event rings.
+	xhci_submission_t *submissions;
 
 	// Ring size in TRBs.
 	size_t size;
@@ -42,11 +50,6 @@ typedef struct {
 	// For event rings, the index of the next event to process.
 	// For command and transfer rings, the index of the next free TRB.
 	size_t index;
-
-	// The doorbell for this ring.
-	// This value is NULL for event rings.
-	volatile uint32_t *doorbell;
-	uint32_t doorbell_value;
 
 	// Cycle bit for the ring.
 	bool cycle;
@@ -56,8 +59,11 @@ typedef struct xhci_ctrl {
 	usb_ctrl_t ctrl;
 	pcienum_t *pci_enum;
 
-	size_t port_count;
+	uint32_t port_count;
+	uint32_t slot_count;
+
 	xhci_port_protocol_t *ports;
+	xhci_device_t **slots;
 
 	xhci_ring_t command_ring;
 	xhci_ring_t event_ring;
@@ -84,7 +90,7 @@ typedef struct {
 	uint8_t port_offset;
 } xhci_root_hub_t;
 
-typedef struct {
+struct xhci_device {
 	usb_device_t device;
 	xhci_ring_t ep_rings[31];
 
@@ -96,7 +102,7 @@ typedef struct {
 	void *device_ctx;
 	void *input_ctx_phys;
 	void *input_ctx;
-} xhci_device_t;
+};
 
 #define CTX_PTR(CTRL, CTX, INDEX) ((uintptr_t)(CTX) + ((CTRL)->ctx_stride * (INDEX)))
 
@@ -122,7 +128,7 @@ static void xhci_update_input_context(xhci_ctrl_t *ctrl, xhci_device_t *dev) {
 	memset(input_ctx, 0, sizeof(uint32_t) * 2);
 }
 
-static bool xhci_alloc_ring(xhci_ctrl_t *ctrl, xhci_ring_t *r, volatile uint32_t *doorbell, uint32_t doorbell_value) {
+static bool xhci_alloc_ring(xhci_ctrl_t *ctrl, xhci_ring_t *r, bool event_ring) {
 	void *ring_phys = pmm_allocpage(PMM_SECTION_DEFAULT);
 	if (ring_phys == NULL)
 		return false;
@@ -135,14 +141,24 @@ static bool xhci_alloc_ring(xhci_ctrl_t *ctrl, xhci_ring_t *r, volatile uint32_t
 	r->ctrl = ctrl;
 	r->size = PAGE_SIZE / sizeof(xhci_trb_t);
 	r->index = 0;
-	r->doorbell = doorbell;
-	r->doorbell_value = doorbell_value;
 	r->cycle = true;
+
+	if (event_ring) {
+		r->submissions = NULL;
+	} else {
+		r->submissions = alloc(sizeof(xhci_submission_t) * r->size);
+		if (r->submissions == NULL) {
+			pmm_release(ring_phys);
+			return false;
+		}
+	}
+
+	SPINLOCK_INIT(r->lock);
 
 	return true;
 }
 
-static void xhci_ring_submit(xhci_ring_t *r, xhci_trb_t *trb, xhci_submission_t *sub, bool ring_db) {
+static void xhci_ring_submit_locked(xhci_ring_t *r, xhci_trb_t *trb, xhci_submission_t *sub) {
 	// Cycle bit must be 0 in the TRB being submitted.
 	__assert((trb->dw3 & XHCI_TRB_DW3_C) == 0);
 
@@ -152,6 +168,7 @@ static void xhci_ring_submit(xhci_ring_t *r, xhci_trb_t *trb, xhci_submission_t 
 		link_trb->parameters = (uint64_t)r->ring_phys;
 		link_trb->dw2 = 0;
 		link_trb->dw3 = XHCI_TRB_DW3_TYPE(TRB_LINK) | XHCI_TRB_DW3_TC | r->cycle;
+
 		// Now wrap around to start of ring and flip cycle bit.
 		r->index = 0;
 		r->cycle ^= 1;
@@ -167,62 +184,73 @@ static void xhci_ring_submit(xhci_ring_t *r, xhci_trb_t *trb, xhci_submission_t 
 		r_trb->dw3 |= XHCI_TRB_DW3_C;
 
 	if (sub != NULL) {
-		// Store back pointer to the submitted TRB so we can
-		// associate the completion event with the submission later.
-		sub->trb = r_trb;
+		xhci_submission_t *r_sub = &r->submissions[idx];
 
-		spinlock_acquire(&r->ctrl->lock);
-		list_push_back(&r->ctrl->submissions, &sub->node);
-		spinlock_release(&r->ctrl->lock);
+		bool old_valid = __atomic_exchange_n(&r_sub->valid, true, __ATOMIC_SEQ_CST);
+		__assert(!old_valid);
+
+		r_sub->completion = sub->completion;
+		r_sub->completion_ctx = sub->completion_ctx;
 	}
+}
 
-	// Ring the doorbell.
-	if (ring_db)
-		*r->doorbell = r->doorbell_value;
+static void xhci_ring_submit(xhci_ring_t *r, xhci_trb_t *trb, xhci_submission_t *sub) {
+	spinlock_acquire(&r->lock);
+	xhci_ring_submit_locked(r, trb, sub);
+	spinlock_release(&r->lock);
 }
 
 typedef struct {
 	xhci_trb_t event_trb;
-	xhci_trb_t associated_trb;
+	xhci_trb_t cmd_trb;
+} xhci_submit_result_t;
+
+typedef struct {
+	xhci_submit_result_t *result;
 	semaphore_t *sem;
-} xhci_submit_ctx_t;
+} xhci_wait_submit_ctx_t;
 
-static void xhci_ring_complete(xhci_submission_t *sub) {
-	xhci_submit_ctx_t *ctx = sub->completion_ctx;
+static void xhci_complete_wait(xhci_submission_t *sub) {
+	xhci_wait_submit_ctx_t *ctx = sub->completion_ctx;
 
-	memcpy(&ctx->event_trb, &sub->event_trb, sizeof(xhci_trb_t));
-	memcpy(&ctx->associated_trb, &sub->associated_trb, sizeof(xhci_trb_t));
+	if (ctx->result != NULL) {
+		memcpy(&ctx->result->event_trb, &sub->event_trb, sizeof(xhci_trb_t));
+		memcpy(&ctx->result->cmd_trb, &sub->cmd_trb, sizeof(xhci_trb_t));
+	}
 
 	semaphore_signal(ctx->sem);
 }
 
-static void xhci_ring_submit_and_wait(xhci_ring_t *r, xhci_trb_t *trb, xhci_trb_t *event_trb, xhci_trb_t *associated_trb) {
+static void xhci_ring_submit_and_wait(xhci_ctrl_t *ctrl, xhci_trb_t *trb, xhci_submit_result_t *result) {
 	semaphore_t sem;
 	SEMAPHORE_INIT(&sem, 0);
 
-	xhci_submit_ctx_t ctx;
+	xhci_wait_submit_ctx_t ctx;
+	ctx.result = result;
 	ctx.sem = &sem;
 
 	xhci_submission_t sub;
-	sub.completion = xhci_ring_complete;
+	sub.completion = xhci_complete_wait;
 	sub.completion_ctx = &ctx;
 
-	xhci_ring_submit(r, trb, &sub, true);
-	semaphore_wait(&sem, false);
+	xhci_ring_submit(&ctrl->command_ring, trb, &sub);
 
-	// Copy out the completed TRBs.
-	if (event_trb != NULL)
-		memcpy(event_trb, &ctx.event_trb, sizeof(xhci_trb_t));
-	if (associated_trb != NULL)
-		memcpy(associated_trb, &ctx.associated_trb, sizeof(xhci_trb_t));
+	// Ring the doorbell.
+	ctrl->dbs[0] = 0;
+
+	semaphore_wait(&sem, false);
 }
 
 static xhci_trb_t *xhci_ring_dequeue(xhci_ring_t *r) {
+	spinlock_acquire(&r->lock);
+
 	xhci_trb_t *r_trb = &r->ring[r->index];
 
 	// Make sure the cycle bit matches.
-	if (((r_trb->dw3 & XHCI_TRB_DW3_C) != 0) != r->cycle)
-		return NULL;
+	if (((r_trb->dw3 & XHCI_TRB_DW3_C) != 0) != r->cycle) {
+		r_trb = NULL;
+		goto out;
+	}
 
 	// Advance offset and flip cycle bit if needed.
 	r->index++;
@@ -231,6 +259,9 @@ static xhci_trb_t *xhci_ring_dequeue(xhci_ring_t *r) {
 		r->index = 0;
 		r->cycle ^= 1;
 	}
+
+out:
+	spinlock_release(&r->lock);
 
 	return r_trb;
 }
@@ -284,10 +315,6 @@ static int xhci_run(xhci_ctrl_t *ctrl) {
 	}
 
 	return 0;
-}
-
-static int xhci_root_hub_reset_port(usb_hub_t *hub, uint8_t port) {
-	_panic("xhci_root_hub_reset_port: not implemented yet", NULL);
 }
 
 static int xhci_root_hub_get_port_status(usb_hub_t *hub, uint8_t port, uint16_t *status, uint16_t *change) {
@@ -388,7 +415,6 @@ static int xhci_root_hub_clear_port_feature(usb_hub_t *hub, uint8_t port, uint16
 }
 
 static usb_hub_ops_t xhci_root_hub_ops = {
-	.reset_port = xhci_root_hub_reset_port,
 	.get_port_status = xhci_root_hub_get_port_status,
 	.set_port_feature = xhci_root_hub_set_port_feature,
 	.clear_port_feature = xhci_root_hub_clear_port_feature,
@@ -415,31 +441,40 @@ static void xhci_handle_events(xhci_ctrl_t *xhci) {
 			uint32_t status = (event_trb.dw2 >> 24) & 0xff;
 			__assert(status == TRB_SUCCESS || status == TRB_SHORT_PACKET);
 
+			xhci_submission_t *sub;
 			xhci_trb_t *trb = MAKE_HHDM(event_trb.parameters);
-			xhci_submission_t *sub = NULL;
 
-			spinlock_acquire(&xhci->lock);
+#define IS_PART_OF_RING(RING, TRB) (void *)((uint64_t)FROM_HHDM((TRB)) & ~(PAGE_SIZE - 1UL)) == (RING)->ring_phys
 
-			list_for_each_safe(&xhci->submissions, node) {
-				xhci_submission_t *s = container_of(node, xhci_submission_t, node);
-				if (s->trb == trb) {
-					sub = s;
-					list_remove(&xhci->submissions, &s->node);
-					break;
+			if (IS_PART_OF_RING(&xhci->command_ring, trb)) {
+				xhci_ring_t *ring = &xhci->command_ring;
+				sub = &ring->submissions[trb - ring->ring];
+			} else {
+				uint32_t slot_id = (event_trb.dw3 >> 24) & 0xff;
+				xhci_device_t *dev = xhci->slots[slot_id - 1];
+				__assert(dev != NULL);
+
+				xhci_ring_t *ring = NULL;
+				for (uint8_t i = 0; i < 31; i++) {
+					if (IS_PART_OF_RING(&dev->ep_rings[i], trb)) {
+						ring = &dev->ep_rings[i];
+						break;
+					}
 				}
+				__assert(ring != NULL);
+
+				sub = &ring->submissions[trb - ring->ring];
 			}
 
-			spinlock_release(&xhci->lock);
+			if (__atomic_exchange_n(&sub->valid, false, __ATOMIC_SEQ_CST)) {
+				__assert(sub->completion != NULL);
 
-			__assert(sub != NULL);
-			__assert(sub->completion != NULL);
+				memcpy(&sub->event_trb, &event_trb, sizeof(xhci_trb_t));
+				memcpy(&sub->cmd_trb, trb, sizeof(xhci_trb_t));
 
-			// Copy the event TRB into the submission.
-			memcpy(&sub->event_trb, &event_trb, sizeof(xhci_trb_t));
-			memcpy(&sub->associated_trb, trb, sizeof(xhci_trb_t));
-
-			// Invoke the completion callback.
-			sub->completion(sub);
+				// Invoke the completion callback.
+				sub->completion(sub);
+			}
 		} else {
 			printf("xhci: unknown event TRB type %u\n", type);
 		}
@@ -510,6 +545,11 @@ static int xhci_ctrl_start(usb_ctrl_t *ctrl) {
 	xhci->ports = alloc(sizeof(xhci_port_protocol_t) * max_ports);
 	__assert(xhci->ports != NULL);
 
+	xhci->slot_count = max_slots;
+	xhci->slots = alloc(sizeof(xhci_device_t *) * max_slots);
+	__assert(xhci->slots != NULL);
+	memset(xhci->slots, 0, sizeof(xhci_device_t *) * max_slots);
+
 	xhci->ctx_stride = (xhci->caps->hccparams1 & XHCI_HCCPARAMS1_CSZ) != 0 ? 64 : 32;
 
 	for (uint32_t i = 0; i < max_ports; i++) {
@@ -517,14 +557,28 @@ static int xhci_ctrl_start(usb_ctrl_t *ctrl) {
 		xhci->ports[i].ver_minor = 0;
 	}
 
-	uint32_t ext_caps_offset = (xhci->caps->hccparams1 >> 16) & 0xffff;
-	uint32_t *ext_caps = (uint32_t *)(bar0.address + ext_caps_offset * 4);
-
+	volatile uint32_t *ext_caps = (uint32_t *)(bar0.address + (((xhci->caps->hccparams1 >> 16) & 0xffff) << 2));
 	for (;;) {
 		uint8_t cap_id = *ext_caps & 0xff;
 		uint8_t next_cap_off = (*ext_caps >> 8) & 0xff;
 
-		if (cap_id == 2) {
+		if (cap_id == 1) {
+			printf("xhci: found BIOS/OS ownership capability\n");
+
+			bool is_bios_owned = (*ext_caps >> 16) & 0x1;
+			if (is_bios_owned) {
+				printf("xhci: attempting to take ownership from BIOS\n");
+
+				while (is_bios_owned) {
+					// Set OS Owned Semaphore.
+					*ext_caps |= (1 << 24);
+					sched_sleep_us(500000); // 500ms
+					is_bios_owned = (*ext_caps >> 16) & 0x1;
+				}
+
+				printf("xhci: took ownership of controller from BIOS\n");
+			}
+		} else if (cap_id == 2) {
 			uint8_t ver_major = (*ext_caps >> 24) & 0xff;
 			uint8_t ver_minor = (*ext_caps >> 16) & 0xff;
 
@@ -561,8 +615,8 @@ static int xhci_ctrl_start(usb_ctrl_t *ctrl) {
 		ext_caps += next_cap_off;
 	}
 
-	__assert(xhci_alloc_ring(xhci, &xhci->command_ring, &xhci->dbs[0], 0));
-	__assert(xhci_alloc_ring(xhci, &xhci->event_ring, NULL, 0));
+	__assert(xhci_alloc_ring(xhci, &xhci->command_ring, false));
+	__assert(xhci_alloc_ring(xhci, &xhci->event_ring, true));
 
 	// Set up MaxSlotsEn field.
 	xhci->opregs->config = max_slots;
@@ -575,18 +629,17 @@ static int xhci_ctrl_start(usb_ctrl_t *ctrl) {
 	memset(dcbaa_virt, 0, PAGE_SIZE);
 
 	// Set up scratchpad buffers if requested.
-	uint32_t max_scratchpads_lo = (xhci->caps->hcsparams2 >> 21) & 0x1f;
-	uint32_t max_scratchpads_hi = (xhci->caps->hcsparams2 >> 27) & 0x1f;
+	uint32_t max_scratchpads_hi = (xhci->caps->hcsparams2 >> 21) & 0x1f;
+	uint32_t max_scratchpads_lo = (xhci->caps->hcsparams2 >> 27) & 0x1f;
 	uint32_t max_scratchpads = max_scratchpads_lo | (max_scratchpads_hi << 5);
 
 	if (max_scratchpads > 0) {
+		printf("xhci: setting up %u scratchpad buffers\n", max_scratchpads);
 		__assert(max_scratchpads < PAGE_SIZE / sizeof(uint64_t));
 
 		void *scratchpad_array_phys = pmm_allocpage(PMM_SECTION_DEFAULT);
 		__assert(scratchpad_array_phys != NULL);
 		uint64_t *scratchpad_array_virt = MAKE_HHDM(scratchpad_array_phys);
-
-		printf("xhci: setting up %u scratchpad buffers\n", max_scratchpads);
 
 		for (uint32_t i = 0; i < max_scratchpads; i++) {
 			void *scratchpad_phys = pmm_allocpage(PMM_SECTION_DEFAULT);
@@ -652,9 +705,6 @@ static int xhci_ctrl_enumerate(usb_ctrl_t *ctrl) {
 	return 0;
 }
 
-// Forward declaration.
-static int xhci_ctrl_xfer(usb_ctrl_t *ctrl, usb_device_t *dev, usb_xfer_t *xfer);
-
 static int xhci_ctrl_address_device(usb_ctrl_t *ctrl, usb_hub_t *hub, uint8_t port, usb_device_t **dev) {
 	xhci_ctrl_t *xhci = container_of(ctrl, xhci_ctrl_t, ctrl);
 	xhci_root_hub_t *rh = container_of(hub, xhci_root_hub_t, hub);
@@ -685,14 +735,13 @@ static int xhci_ctrl_address_device(usb_ctrl_t *ctrl, usb_hub_t *hub, uint8_t po
 	else if (port_speed >= XHCI_PORT_SPEED_SS_1X1 && port_speed <= XHCI_PORT_SPEED_SS_2X2)
 		xhci_dev->device.speed = USB_SPEED_SUPER;
 
-	xhci_trb_t event_trb;
-	xhci_trb_t associated_trb;
+	xhci_submit_result_t result;
 
 	{
 		xhci_trb_t trb = {0};
 		trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_ENABLE_SLOT);
-		xhci_ring_submit_and_wait(&xhci->command_ring, &trb, &event_trb, &associated_trb);
-		__assert(((event_trb.dw2 >> 24) & 0xff) == TRB_SUCCESS);
+		xhci_ring_submit_and_wait(xhci, &trb, &result);
+		__assert(((result.event_trb.dw2 >> 24) & 0xff) == TRB_SUCCESS);
 	}
 
 	void *device_ctx_phys = pmm_allocpage(PMM_SECTION_DEFAULT);
@@ -707,14 +756,15 @@ static int xhci_ctrl_address_device(usb_ctrl_t *ctrl, usb_hub_t *hub, uint8_t po
 	xhci_dev->input_ctx = MAKE_HHDM(input_ctx_phys);
 	memset(xhci_dev->input_ctx, 0, PAGE_SIZE);
 
-	xhci_dev->slot_id = (event_trb.dw3 >> 24) & 0xff;
+	xhci_dev->slot_id = (result.event_trb.dw3 >> 24) & 0xff;
 	printf("xhci: allocated slot %u for device %s:%u\n", xhci_dev->slot_id, hub->name, port);
 
 	// Set up the Device Context Base Address Array entry.
 	xhci->dcbaa[xhci_dev->slot_id] = (uint64_t)device_ctx_phys;
+	xhci->slots[xhci_dev->slot_id - 1] = xhci_dev;
 
 	// Allocate the EP0 ring.
-	__assert(xhci_alloc_ring(xhci, &xhci_dev->ep_rings[0], &xhci->dbs[xhci_dev->slot_id], 1));
+	__assert(xhci_alloc_ring(xhci, &xhci_dev->ep_rings[0], false));
 
 	// Set up the input context and address the device.
 	volatile xhci_input_ctx_t *input_ctx = xhci_get_input_ctrl_ctx(xhci, xhci_dev);
@@ -751,8 +801,8 @@ static int xhci_ctrl_address_device(usb_ctrl_t *ctrl, usb_hub_t *hub, uint8_t po
 		xhci_trb_t trb = {0};
 		trb.parameters = (uint64_t)xhci_dev->input_ctx_phys;
 		trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_ADDRESS_DEVICE) | (xhci_dev->slot_id << 24);
-		xhci_ring_submit_and_wait(&xhci->command_ring, &trb, &event_trb, &associated_trb);
-		__assert(((event_trb.dw2 >> 24) & 0xff) == TRB_SUCCESS);
+		xhci_ring_submit_and_wait(xhci, &trb, &result);
+		__assert(((result.event_trb.dw2 >> 24) & 0xff) == TRB_SUCCESS);
 	}
 
 	printf("xhci: addressed device on slot %u\n", xhci_dev->slot_id);
@@ -764,23 +814,8 @@ static int xhci_ctrl_address_device(usb_ctrl_t *ctrl, usb_hub_t *hub, uint8_t po
 	// Figure out the max packet size for EP0 by reading the device descriptor.
 	usb_device_desc_t dev_desc;
 
-	usb_setup_t setup;
-	setup.bmRequestType = USB_REQUEST_RECIP_DEVICE | USB_REQUEST_STANDARD | USB_REQUEST_DIR_TO_HOST;
-	setup.bRequest = USB_REQUEST_GET_DESCRIPTOR;
-	setup.wValue = (USB_DESCRIPTOR_TYPE_DEVICE << 8);
-	setup.wIndex = 0;
-	setup.wLength = 8;
-
-	usb_xfer_t xfer = {0};
-	xfer.dir = USB_TRANSFER_TO_HOST;
-	xfer.type = USB_TRANSFER_CONTROL;
-	xfer.setup = &setup;
-	xfer.buffer = &dev_desc;
-	xfer.length = 8;
-	xfer.completion = NULL;
-
-	int res = xhci_ctrl_xfer(ctrl, &xhci_dev->device, &xfer);
-	__assert(res == 8);
+	int res = usb_get_descriptor(&xhci_dev->device, USB_DESCRIPTOR_TYPE_DEVICE, 0, &dev_desc, sizeof(dev_desc));
+	__assert(res == 0);
 
 	// Update EP0 context with correct max packet size.
 	xhci_dev->device.max_packet_size0 = dev_desc.bMaxPacketSize0;
@@ -793,8 +828,8 @@ static int xhci_ctrl_address_device(usb_ctrl_t *ctrl, usb_hub_t *hub, uint8_t po
 		xhci_trb_t trb = {0};
 		trb.parameters = (uint64_t)xhci_dev->input_ctx_phys;
 		trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_EVALUATE_CTX) | (xhci_dev->slot_id << 24);
-		xhci_ring_submit_and_wait(&xhci->command_ring, &trb, &event_trb, &associated_trb);
-		__assert(((event_trb.dw2 >> 24) & 0xff) == TRB_SUCCESS);
+		xhci_ring_submit_and_wait(xhci, &trb, &result);
+		__assert(((result.event_trb.dw2 >> 24) & 0xff) == TRB_SUCCESS);
 	}
 
 	// Update the input context again.
@@ -814,7 +849,7 @@ static int xhci_ctrl_configure_ep(usb_ctrl_t *ctrl, usb_device_t *dev, usb_endpo
 	uint32_t ep_num = ep->desc.bEndpointAddress & USB_ENDPOINT_ADDRESS_NUM_MASK;
 	uint32_t ep_index = ep_num ? ((ep_num << 1) | (is_in ? 1 : 0)) : 0;
 
-	__assert(xhci_alloc_ring(xhci, &xhci_dev->ep_rings[ep_index - 1], NULL, 0));
+	__assert(xhci_alloc_ring(xhci, &xhci_dev->ep_rings[ep_index - 1], false));
 
 	volatile xhci_input_ctx_t *input_ctx = xhci_get_input_ctrl_ctx(xhci, xhci_dev);
 	volatile xhci_slot_ctx_t *slot_ctx = xhci_get_input_slot_ctx(xhci, xhci_dev);
@@ -839,181 +874,266 @@ static int xhci_ctrl_configure_ep(usb_ctrl_t *ctrl, usb_device_t *dev, usb_endpo
 		ep_ctx->dw1.max_packet_size = ep->desc.wMaxPacketSize;
 		ep_ctx->dw1.max_burst_size = (ep->desc.wMaxPacketSize >> 11) & 0x3;
 		ep_ctx->dw4.max_esit_payload_lo = ep->desc.wMaxPacketSize;
-
-		uint64_t ep_ring_phys = (uint64_t)xhci_dev->ep_rings[ep_index - 1].ring_phys;
-		ep_ctx->dw2.dcs = xhci_dev->ep_rings[ep_index - 1].cycle;
-		ep_ctx->dw2.tr_dequeue_pointer_lo = (uint32_t)((ep_ring_phys >> 4) & 0xffffffff);
-		ep_ctx->dw3.tr_dequeue_pointer_hi = (uint32_t)(ep_ring_phys >> 32);
 	} else {
 		return -EINVAL;
 	}
 
+	// Set up the ring dequeue pointer.
+	uint64_t ep_ring_phys = (uint64_t)xhci_dev->ep_rings[ep_index - 1].ring_phys;
+	ep_ctx->dw2.dcs = xhci_dev->ep_rings[ep_index - 1].cycle;
+	ep_ctx->dw2.tr_dequeue_pointer_lo = (uint32_t)((ep_ring_phys >> 4) & 0xffffffff);
+	ep_ctx->dw3.tr_dequeue_pointer_hi = (uint32_t)(ep_ring_phys >> 32);
+
 	// Submit a Configure Endpoint command.
-	xhci_trb_t event_trb;
-	xhci_trb_t associated_trb;
 	xhci_trb_t trb = {0};
 	trb.parameters = (uint64_t)xhci_dev->input_ctx_phys;
 	trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_CONFIGURE_EP) | (xhci_dev->slot_id << 24);
-	xhci_ring_submit_and_wait(&xhci->command_ring, &trb, &event_trb, &associated_trb);
-	__assert(((event_trb.dw2 >> 24) & 0xff) == TRB_SUCCESS);
+
+	xhci_submit_result_t result;
+	xhci_ring_submit_and_wait(xhci, &trb, &result);
+	__assert(((result.event_trb.dw2 >> 24) & 0xff) == TRB_SUCCESS);
 
 	return 0;
 }
 
-static void xhci_control_xfer(xhci_ctrl_t *xhci, xhci_device_t *dev, usb_xfer_t *xfer, xhci_submission_t *sub, xhci_submission_t *data_sub) {
-	usb_setup_t *setup = xfer->setup;
+static void xhci_control_xfer(xhci_ctrl_t *xhci, xhci_device_t *dev, usb_xfer_t *xfer, xhci_submission_t *sub) {
+	__assert(xfer->ep == NULL);
+	__assert(xfer->setup != NULL);
+
+	// Why would anyone want to do scatter-gather control transfers???
+	__assert(!(xfer->flags & USB_XFER_FLAG_IOVEC));
 
 	// Make sure direction matches request type and length matches buffer length.
-	__assert(xfer->dir == ((setup->bmRequestType >> 7) & 1));
-	__assert(xfer->length == setup->wLength);
+	usb_setup_t *setup = xfer->setup;
 
-	bool has_data_stage = xfer->buffer != NULL && xfer->length > 0;
-	bool data_stage_in = has_data_stage && xfer->dir == USB_TRANSFER_TO_HOST;
+	__assert(xfer->data_length == setup->wLength);
 
-	uint32_t trt = 0;
-	if (has_data_stage)
-		// 0 = no data stage, 2 = data out, 3 = data in
-		trt = data_stage_in ? 3 : 2;
-
-	xhci_trb_t setup_trb = {0};
-	setup_trb.dw0 = (uint32_t)setup->bmRequestType | ((uint32_t)setup->bRequest << 8) | ((uint32_t)setup->wValue << 16);
-	setup_trb.dw1 = (uint32_t)setup->wIndex | ((uint32_t)setup->wLength << 16);
-	setup_trb.dw2 = 8; // always 8 bytes for setup stage
-	setup_trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_SETUP_STAGE) | XHCI_TRB_DW3_TRT(trt) | XHCI_TRB_DW3_IDT;
-
-	xhci_trb_t data_trb = {0};
-	if (has_data_stage) {
-		uint64_t page_offset = (uint64_t)xfer->buffer & (PAGE_SIZE - 1);
-		__assert(page_offset + xfer->length <= PAGE_SIZE);
-
-		void *page = vmm_getphysical(xfer->buffer - page_offset, true);
-		__assert(page != NULL);
-
-		data_trb.parameters = (uint64_t)page + page_offset;
-		data_trb.dw2 = (uint32_t)xfer->length;
-		data_trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_DATA_STAGE) | XHCI_TRB_DW3_ISP | (data_stage_in ? XHCI_TRB_DW3_DIR : 0);
-
-		if (data_sub != NULL)
-			data_trb.dw3 |= XHCI_TRB_DW3_IOC;
+	if (setup->bmRequestType & USB_REQUEST_DIR_TO_HOST) {
+		__assert(xfer->flags & USB_XFER_FLAG_TO_HOST);
+	} else {
+		__assert(xfer->flags & USB_XFER_FLAG_TO_DEVICE);
 	}
 
-	xhci_trb_t status_trb = {0};
-	status_trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_STATUS_STAGE) | XHCI_TRB_DW3_IOC | (data_stage_in ? 0 : XHCI_TRB_DW3_DIR);
+	bool has_data_stage = xfer->data != NULL && xfer->data_length > 0;
+	bool data_stage_in = has_data_stage && xfer->flags & USB_XFER_FLAG_TO_HOST;
 
-	xhci_ring_submit(&dev->ep_rings[0], &setup_trb, NULL, false);
-	if (has_data_stage)
-		xhci_ring_submit(&dev->ep_rings[0], &data_trb, data_sub, false);
-	xhci_ring_submit(&dev->ep_rings[0], &status_trb, sub, false);
+	xhci_ring_t *ring = &dev->ep_rings[0];
+
+	spinlock_acquire(&ring->lock);
+
+	{
+		uint32_t trt = 0;
+		if (has_data_stage)
+			// 0 = no data stage, 2 = data out, 3 = data in
+			trt = data_stage_in ? 3 : 2;
+
+		xhci_trb_t setup_trb = {0};
+		setup_trb.dw0 = (uint32_t)setup->bmRequestType | ((uint32_t)setup->bRequest << 8) | ((uint32_t)setup->wValue << 16);
+		setup_trb.dw1 = (uint32_t)setup->wIndex | ((uint32_t)setup->wLength << 16);
+		setup_trb.dw2 = 8; // Always 8 bytes for setup stage.
+		setup_trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_SETUP_STAGE) | XHCI_TRB_DW3_TRT(trt) | XHCI_TRB_DW3_IDT;
+
+		xhci_ring_submit_locked(ring, &setup_trb, NULL);
+	}
+
+	if (has_data_stage) {
+		xhci_trb_t data_trb = {0};
+
+		// Make sure the data transfer does not cross a page boundary.
+		uint64_t page_offset = (uint64_t)xfer->data & (PAGE_SIZE - 1);
+		__assert(page_offset + xfer->data_length <= PAGE_SIZE);
+
+		if (xfer->flags & USB_XFER_FLAG_BUFFER_PHYSICAL) {
+			data_trb.parameters = (uint64_t)xfer->data;
+		} else {
+			void *page = vmm_getphysical(xfer->data - page_offset, true);
+			__assert(page != NULL);
+			data_trb.parameters = (uint64_t)page + page_offset;
+		}
+
+		data_trb.dw2 = (uint32_t)xfer->data_length;
+		data_trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_DATA_STAGE) | XHCI_TRB_DW3_ISP | XHCI_TRB_DW3_IOC | (data_stage_in ? XHCI_TRB_DW3_DIR : 0);
+
+		xhci_ring_submit_locked(ring, &data_trb, sub);
+	}
+
+	{
+		xhci_trb_t status_trb = {0};
+		status_trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_STATUS_STAGE) | XHCI_TRB_DW3_IOC | (data_stage_in ? 0 : XHCI_TRB_DW3_DIR);
+		xhci_ring_submit_locked(ring, &status_trb, sub);
+	}
+
+	spinlock_release(&ring->lock);
 
 	// Ring the doorbell for the control endpoint.
 	xhci->dbs[dev->slot_id] = 1;
 }
 
+static void xhci_sg_data_xfer(xhci_ctrl_t *xhci, xhci_ring_t *ring, xhci_device_t *dev, usb_xfer_t *xfer, xhci_submission_t *sub) {
+	uint32_t td_count = (xfer->iov->total_size + xfer->ep->desc.wMaxPacketSize - 1) / xfer->ep->desc.wMaxPacketSize;
+	uint32_t done = 0;
+
+	spinlock_acquire(&ring->lock);
+
+	while (done < xfer->iov->total_size) {
+		size_t page_offset, page_remaining;
+		void *page;
+
+		int err = iovec_iterator_next_page(xfer->iov, &page_offset, &page_remaining, &page);
+		__assert(err == 0);
+
+		size_t to_xfer = min(page_remaining, xfer->iov->total_size - done);
+
+		uint8_t td_size = td_count - (done + to_xfer) / xfer->ep->desc.wMaxPacketSize;
+		if (done + to_xfer == xfer->iov->total_size)
+			td_size = 0;
+		else if (td_size > 31)
+			td_size = 31;
+
+		xhci_trb_t trb = {0};
+		trb.parameters = (uint64_t)page + page_offset;
+		trb.dw2 = XHCI_TRB_DW2_TR_LEN(to_xfer) | XHCI_TRB_DW2_TD_SIZE(td_size);
+		trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_NORMAL) | XHCI_TRB_DW3_ISP | XHCI_TRB_DW3_IOC;
+
+		if (to_xfer + done < xfer->iov->total_size)
+			// More TRBs to come in this transfer, set the CH bit.
+			trb.dw3 |= XHCI_TRB_DW3_CH;
+
+		xhci_ring_submit_locked(ring, &trb, sub);
+		done += to_xfer;
+	}
+
+	spinlock_release(&ring->lock);
+}
+
 static void xhci_data_xfer(xhci_ctrl_t *xhci, xhci_device_t *dev, usb_xfer_t *xfer, xhci_submission_t *sub) {
-	xhci_trb_t trb = {0};
-	uint64_t page_offset = (uint64_t)xfer->buffer & (PAGE_SIZE - 1);
-	__assert(page_offset + xfer->length <= PAGE_SIZE);
-
-	void *page = vmm_getphysical(xfer->buffer - page_offset, true);
-	__assert(page != NULL);
-
-	trb.parameters = (uint64_t)page + page_offset;
-	trb.dw2 = (uint32_t)xfer->length;
-	trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_NORMAL) | XHCI_TRB_DW3_ISP | XHCI_TRB_DW3_IOC;
+	__assert(xfer->ep != NULL);
+	__assert(xfer->setup == NULL);
 
 	uint32_t ep_num = xfer->ep->desc.bEndpointAddress & USB_ENDPOINT_ADDRESS_NUM_MASK;
 	uint32_t ep_index = (ep_num << 1) | (xfer->ep->desc.bEndpointAddress & USB_ENDPOINT_ADDRESS_DIR_IN ? 1 : 0);
 
-	xhci_ring_submit(&dev->ep_rings[ep_index - 1], &trb, sub, false);
+	xhci_ring_t *ring = &dev->ep_rings[ep_index - 1];
+
+	if (xfer->flags & USB_XFER_FLAG_IOVEC) {
+		xhci_sg_data_xfer(xhci, ring, dev, xfer, sub);
+	} else {
+		// Make sure the data transfer does not cross a page boundary.
+		uint64_t page_offset = (uint64_t)xfer->data & (PAGE_SIZE - 1);
+		__assert(page_offset + xfer->data_length <= PAGE_SIZE);
+
+		xhci_trb_t trb = {0};
+		if (xfer->flags & USB_XFER_FLAG_BUFFER_PHYSICAL) {
+			pmm_hold(xfer->data - page_offset);
+			trb.parameters = (uint64_t)xfer->data;
+		} else {
+			void *page = vmm_getphysical(xfer->data - page_offset, true);
+			__assert(page != NULL);
+			trb.parameters = (uint64_t)page + page_offset;
+		}
+
+		trb.dw2 = (uint32_t)xfer->data_length;
+		trb.dw3 = XHCI_TRB_DW3_TYPE(TRB_NORMAL) | XHCI_TRB_DW3_ISP | XHCI_TRB_DW3_IOC;
+
+		xhci_ring_submit(ring, &trb, sub);
+	}
 
 	// Ring the doorbell for the endpoint.
 	xhci->dbs[dev->slot_id] = ep_index;
 }
 
+#define XHCI_XFER_SUBMIT_FLAG_WAIT (1ULL << 0)
+
 typedef struct {
 	usb_xfer_t *xfer;
 	semaphore_t *sem;
 
-	xhci_trb_t event_trb;
+	// Set upon completion, right before the semaphore is signalled.
 	usb_status_t status;
 	uint32_t xfer_len;
-} xhci_xfer_ctx_t;
+} xhci_xfer_submit_t;
 
-static void xhci_xfer_data_complete(xhci_submission_t *sub) {
-	pmm_release((void *)(sub->associated_trb.parameters & ~(uint64_t)(PAGE_SIZE - 1)));
-}
+static void xhci_complete_xfer(xhci_submission_t *sub) {
+	uint32_t cmd_type = (sub->cmd_trb.dw3 >> 10) & 0x3f;
+	if (cmd_type == TRB_DATA_STAGE || cmd_type == TRB_NORMAL) {
+		// Unpin the memory page used for the transfer.
+		pmm_release((void *)(sub->cmd_trb.parameters & ~(PAGE_SIZE - 1)));
 
-static void xhci_xfer_complete(xhci_submission_t *sub) {
-	xhci_xfer_ctx_t *ctx = sub->completion_ctx;
-
-	memcpy(&ctx->event_trb, &sub->event_trb, sizeof(xhci_trb_t));
-	uint32_t status = (ctx->event_trb.dw2 >> 24) & 0xff;
-
-	if (status == TRB_SUCCESS) {
-		ctx->status = USB_STATUS_SUCCESS;
-		ctx->xfer_len = ctx->xfer->length;
-	} else if (status == TRB_SHORT_PACKET) {
-		uint32_t residual = ctx->event_trb.dw2 & 0xffffff;
-		ctx->status = USB_STATUS_SUCCESS;
-		ctx->xfer_len = ctx->xfer->length - residual;
+		// Check if we need to wait for more TRBs to complete.
+		if (cmd_type == TRB_DATA_STAGE || (sub->cmd_trb.dw3 & XHCI_TRB_DW3_CH) != 0) {
+			return;
+		}
 	} else {
-		ctx->status = USB_STATUS_ERROR;
-		ctx->xfer_len = 0;
+		__assert(cmd_type == TRB_STATUS_STAGE);
 	}
 
-	if (ctx->sem != NULL) {
+	usb_xfer_t *xfer;
+	if ((uintptr_t)sub->completion_ctx & XHCI_XFER_SUBMIT_FLAG_WAIT) {
+		xhci_xfer_submit_t *ctx = (void *)((uintptr_t)sub->completion_ctx & ~XHCI_XFER_SUBMIT_FLAG_WAIT);
+		xfer = ctx->xfer;
+	} else {
+		xfer = sub->completion_ctx;
+	}
+
+	// Complete the transfer.
+	usb_status_t usb_status;
+	uint32_t xfer_len;
+
+	uint32_t status = (sub->event_trb.dw2 >> 24) & 0xff;
+	if (status == TRB_SUCCESS) {
+		usb_status = USB_STATUS_SUCCESS;
+		xfer_len = xfer->data_length;
+	} else if (status == TRB_SHORT_PACKET) {
+		usb_status = USB_STATUS_SUCCESS;
+		xfer_len = xfer->data_length - (sub->event_trb.dw2 & 0xffffff);
+	} else {
+		usb_status = USB_STATUS_ERROR;
+		xfer_len = 0;
+	}
+
+	if ((uintptr_t)sub->completion_ctx & XHCI_XFER_SUBMIT_FLAG_WAIT) {
+		xhci_xfer_submit_t *ctx = (void *)((uintptr_t)sub->completion_ctx & ~XHCI_XFER_SUBMIT_FLAG_WAIT);
+		ctx->status = usb_status;
+		ctx->xfer_len = xfer_len;
+
 		semaphore_signal(ctx->sem);
 	} else {
-		__assert(ctx->xfer->completion != NULL);
-		ctx->xfer->completion(ctx->xfer, ctx->status, ctx->xfer_len);
+		xfer->completion(xfer, usb_status, xfer_len);
 	}
-
-	// For bulk and interrupt transfers, this submission is for the data stage.
-	if (ctx->xfer->type == USB_TRANSFER_BULK || ctx->xfer->type == USB_TRANSFER_INTERRUPT)
-		xhci_xfer_data_complete(sub);
 }
 
 static int xhci_ctrl_xfer(usb_ctrl_t *ctrl, usb_device_t *dev, usb_xfer_t *xfer) {
 	xhci_ctrl_t *xhci = container_of(ctrl, xhci_ctrl_t, ctrl);
 	xhci_device_t *xhci_dev = container_of(dev, xhci_device_t, device);
 
-	semaphore_t sem;
-	SEMAPHORE_INIT(&sem, 0);
-
-	xhci_xfer_ctx_t *ctx = alloc(sizeof(xhci_xfer_ctx_t));
-	__assert(ctx != NULL);
-	ctx->xfer = xfer;
-
-	if (xfer->completion == NULL)
-		ctx->sem = &sem;
-	else
-		ctx->sem = NULL;
-
-	xhci_submission_t *sub = alloc(sizeof(xhci_submission_t));
-	__assert(sub != NULL);
-	sub->completion = xhci_xfer_complete;
-	sub->completion_ctx = ctx;
-
-	xhci_submission_t *data_sub = alloc(sizeof(xhci_submission_t));
-	__assert(data_sub != NULL);
-	data_sub->completion = xhci_xfer_data_complete;
-	data_sub->completion_ctx = NULL;
-
-	if (xfer->type == USB_TRANSFER_CONTROL) {
-		__assert(xfer->ep == NULL);
-		__assert(xfer->setup != NULL);
-
-		xhci_control_xfer(xhci, xhci_dev, xfer, sub, data_sub);
-	} else {
-		__assert(xfer->ep != NULL);
-		__assert(xfer->setup == NULL);
-
-		xhci_data_xfer(xhci, xhci_dev, xfer, sub);
-	}
-
+	// If no completion callback is set, we need to wait for the transfer to complete.
 	if (xfer->completion == NULL) {
+		semaphore_t sem;
+		SEMAPHORE_INIT(&sem, 0);
+
+		xhci_xfer_submit_t ctx;
+		ctx.xfer = xfer;
+		ctx.sem = &sem;
+
+		xhci_submission_t sub;
+		sub.completion = xhci_complete_xfer;
+		sub.completion_ctx = (void *)((uintptr_t)&ctx | XHCI_XFER_SUBMIT_FLAG_WAIT);
+
+		if (xfer->type == USB_XFER_TYPE_CONTROL)
+			xhci_control_xfer(xhci, xhci_dev, xfer, &sub);
+		else
+			xhci_data_xfer(xhci, xhci_dev, xfer, &sub);
+
 		semaphore_wait(&sem, false);
-		return (ctx->status == USB_STATUS_SUCCESS) ? ctx->xfer_len : -EIO;
+	} else {
+		xhci_submission_t sub;
+		sub.completion = xhci_complete_xfer;
+		sub.completion_ctx = xfer;
+
+		if (xfer->type == USB_XFER_TYPE_CONTROL)
+			xhci_control_xfer(xhci, xhci_dev, xfer, &sub);
+		else
+			xhci_data_xfer(xhci, xhci_dev, xfer, &sub);
 	}
 
 	return 0;

@@ -216,7 +216,7 @@ static void usb_hid_process_boot_mouse_report(usb_hid_driver_data_t *data, uint8
 }
 
 static void usb_hid_process_report(usb_xfer_t *xfer, usb_status_t status, uint32_t transferred) {
-	usb_hid_driver_data_t *data = container_of(xfer, usb_hid_driver_data_t, intr_in_xfer);
+	usb_hid_driver_data_t *data = xfer->completion_ctx;
 
 	// Process the HID report.
 	if (data->hid_interface.bInterfaceProtocol == USB_PROTOCOL_KEYBOARD)
@@ -287,47 +287,37 @@ static int usb_hid_attach(usb_device_t *dev, usb_probe_ctx_t *ctx, void **driver
 	__assert(intr_in_ep != NULL);
 
 	// Enable the boot protocol.
-	usb_setup_t setup = {0};
-	setup.bmRequestType = USB_REQUEST_RECIP_INTERFACE | USB_REQUEST_CLASS | USB_REQUEST_DIR_TO_DEVICE;
-	setup.bRequest = 0x0b; // SET_PROTOCOL
-	setup.wValue = 0; // Boot Protocol
-	setup.wIndex = boot_interface->bInterfaceNumber;
-	setup.wLength = 0;
+	{
+		usb_setup_t setup = {0};
+		setup.bmRequestType = USB_REQUEST_RECIP_INTERFACE | USB_REQUEST_CLASS | USB_REQUEST_DIR_TO_DEVICE;
+		setup.bRequest = 0x0b; // SET_PROTOCOL
+		setup.wValue = 0; // Boot Protocol
+		setup.wIndex = boot_interface->bInterfaceNumber;
+		setup.wLength = 0;
 
-	usb_xfer_t xfer = {0};
-	xfer.dir = USB_TRANSFER_TO_DEVICE;
-	xfer.type = USB_TRANSFER_CONTROL;
-	xfer.setup = &setup;
-	xfer.buffer = NULL;
-	xfer.length = 0;
-	xfer.completion = NULL;
-
-	int res = usb_submit_xfer(dev, &xfer);
-	__assert(res == 0);
+		int res = usb_control_xfer(dev, &setup, NULL);
+		__assert(res == 0);
+	}
 
 	// Send a SET_IDLE request to the device.
-	setup.bmRequestType = USB_REQUEST_RECIP_INTERFACE | USB_REQUEST_CLASS | USB_REQUEST_DIR_TO_DEVICE;
-	setup.bRequest = 0x0a; // SET_IDLE
-	setup.wValue = 0;
-	setup.wIndex = boot_interface->bInterfaceNumber;
-	setup.wLength = 0;
+	{
+		usb_setup_t setup = {0};
+		setup.bmRequestType = USB_REQUEST_RECIP_INTERFACE | USB_REQUEST_CLASS | USB_REQUEST_DIR_TO_DEVICE;
+		setup.bRequest = 0x0a; // SET_IDLE
+		setup.wValue = 0;
+		setup.wIndex = boot_interface->bInterfaceNumber;
+		setup.wLength = 0;
 
-	xfer.dir = USB_TRANSFER_TO_DEVICE;
-	xfer.type = USB_TRANSFER_CONTROL;
-	xfer.setup = &setup;
-	xfer.buffer = NULL;
-	xfer.length = 0;
-	xfer.completion = NULL;
-
-	res = usb_submit_xfer(dev, &xfer);
-	__assert(res == 0);
+		int res = usb_control_xfer(dev, &setup, NULL);
+		__assert(res == 0);
+	}
 
 	// Configure the interrupt IN endpoint.
 	usb_endpoint_t *ep = alloc(sizeof(usb_endpoint_t));
 	__assert(ep != NULL);
 	memcpy(&ep->desc, intr_in_ep, sizeof(usb_endpoint_desc_t));
 
-	res = usb_configure_endpoint(dev, ep);
+	int res = usb_configure_endpoint(dev, ep);
 	__assert(res == 0);
 
 	usb_hid_driver_data_t *data = alloc(sizeof(usb_hid_driver_data_t));
@@ -338,21 +328,21 @@ static int usb_hid_attach(usb_device_t *dev, usb_probe_ctx_t *ctx, void **driver
 	else if (boot_interface->bInterfaceProtocol == USB_PROTOCOL_MOUSE)
 		data->device.mouse = mouse_new();
 
-	*driver_data = data;
-
 	data->dev = dev;
 	memcpy(&data->hid_interface, boot_interface, sizeof(usb_interface_desc_t));
 
 	data->intr_in_xfer.ep = ep;
-	data->intr_in_xfer.dir = USB_TRANSFER_TO_HOST;
-	data->intr_in_xfer.type = USB_TRANSFER_INTERRUPT;
-	data->intr_in_xfer.buffer = data->report_buffer;
-	data->intr_in_xfer.length = sizeof(data->report_buffer);
+	data->intr_in_xfer.flags = USB_XFER_FLAG_TO_HOST;
+	data->intr_in_xfer.type = USB_XFER_TYPE_INTERRUPT;
+	data->intr_in_xfer.data = data->report_buffer;
+	data->intr_in_xfer.data_length = intr_in_ep->wMaxPacketSize;
 	data->intr_in_xfer.completion = usb_hid_process_report;
+	data->intr_in_xfer.completion_ctx = data;
 
 	res = usb_submit_xfer(dev, &data->intr_in_xfer);
 	__assert(res == 0);
 
+	*driver_data = data;
 	return 0;
 }
 
