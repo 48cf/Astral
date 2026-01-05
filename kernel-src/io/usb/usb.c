@@ -84,14 +84,6 @@ static int usb_probe_device(usb_device_t *dev) {
 	return best_driver ? 0 : -ENODEV;
 }
 
-static void default_completion(usb_xfer_t *xfer, usb_status_t status, uint32_t transferred) {
-	__assert(status == USB_STATUS_SUCCESS);
-	__assert(transferred == xfer->length);
-
-	semaphore_t *sem = xfer->completion_ctx;
-	semaphore_signal(sem);
-}
-
 int usb_hub_start(usb_hub_t *hub) {
 	// Power on all ports
 	for (uint8_t port = 0; port < hub->port_count; port++) {
@@ -137,7 +129,8 @@ int usb_hub_enumerate_port(usb_hub_t *hub, uint8_t port) {
 			printf("usb: device connected: %s:%u\n", hub->name, port);
 			hub_port->status = USB_HUB_PORT_RESETTING;
 
-			// reset the port and shi...
+			res = hub->ops->set_port_feature(hub, port, USB_HUB_FEATURE_PORT_RESET);
+			__assert(res == 0);
 		} else if (hub_port->status != USB_HUB_PORT_DISCONNECTED && !(status & USB_HUB_PORT_STATUS_PORT_CONNECTION)) {
 			printf("usb: device disconnected: %s:%u\n", hub->name, port);
 
@@ -169,7 +162,14 @@ int usb_hub_enumerate_port(usb_hub_t *hub, uint8_t port) {
 			hub_port->device = dev;
 
 			res = usb_probe_device(dev);
-			__assert(res == 0);
+			if (res != 0) {
+				printf("usb: no driver for device on %s:%u\n", hub->name, port);
+
+				hub_port->status = USB_HUB_PORT_DISCONNECTED;
+				hub_port->device = NULL;
+
+				// TODO: Free device structure and disable port
+			}
 		} else {
 			hub_port->status = USB_HUB_PORT_DISCONNECTED;
 		}
@@ -180,24 +180,18 @@ int usb_hub_enumerate_port(usb_hub_t *hub, uint8_t port) {
 
 int usb_submit_xfer(usb_device_t *dev, usb_xfer_t *xfer) {
 	usb_ctrl_t *ctrl = dev->hub->ctrl;
+	return ctrl->ops->xfer(ctrl, dev, xfer);
+}
 
-	// If a completion callback is provided, use it directly.
-	if (xfer->completion != NULL)
-		return ctrl->ops->xfer(ctrl, dev, xfer);
+int usb_control_xfer(usb_device_t *dev, usb_setup_t *setup, void *buffer) {
+	usb_xfer_t xfer = {0};
+	xfer.flags = (setup->bmRequestType & USB_REQUEST_DIR_TO_HOST) ? USB_XFER_FLAG_TO_HOST : USB_XFER_FLAG_TO_DEVICE;
+	xfer.type = USB_XFER_TYPE_CONTROL;
+	xfer.setup = setup;
+	xfer.data = buffer;
+	xfer.data_length = setup->wLength;
 
-	// Otherwise use a semaphore to wait for completion.
-	semaphore_t sem;
-	SEMAPHORE_INIT(&sem, 0);
-
-	xfer->completion = default_completion;
-	xfer->completion_ctx = &sem;
-
-	int ret = ctrl->ops->xfer(ctrl, dev, xfer);
-	if (ret < 0)
-		return ret;
-
-	semaphore_wait(&sem, false);
-	return 0;
+	return usb_submit_xfer(dev, &xfer);
 }
 
 int usb_configure_endpoint(usb_device_t *dev, usb_endpoint_t *ep) {
@@ -213,15 +207,7 @@ int usb_get_descriptor(usb_device_t *dev, uint8_t desc_type, uint8_t desc_index,
 	setup.wIndex = 0;
 	setup.wLength = length;
 
-	usb_xfer_t xfer = {0};
-	xfer.dir = USB_TRANSFER_TO_HOST;
-	xfer.type = USB_TRANSFER_CONTROL;
-	xfer.setup = &setup;
-	xfer.buffer = buffer;
-	xfer.length = length;
-	xfer.completion = NULL;
-
-	return usb_submit_xfer(dev, &xfer);
+	return usb_control_xfer(dev, &setup, buffer);
 }
 
 int usb_set_configuration(usb_device_t *dev, uint8_t config_value) {
@@ -232,15 +218,7 @@ int usb_set_configuration(usb_device_t *dev, uint8_t config_value) {
 	setup.wIndex = 0;
 	setup.wLength = 0;
 
-	usb_xfer_t xfer = {0};
-	xfer.dir = USB_TRANSFER_TO_DEVICE;
-	xfer.type = USB_TRANSFER_CONTROL;
-	xfer.setup = &setup;
-	xfer.buffer = NULL;
-	xfer.length = 0;
-	xfer.completion = NULL;
-
-	return usb_submit_xfer(dev, &xfer);
+	return usb_control_xfer(dev, &setup, NULL);
 }
 
 int usb_set_interface(usb_device_t *dev, uint8_t interface_number, uint8_t alt_setting) {
@@ -251,13 +229,5 @@ int usb_set_interface(usb_device_t *dev, uint8_t interface_number, uint8_t alt_s
 	setup.wIndex = interface_number;
 	setup.wLength = 0;
 
-	usb_xfer_t xfer = {0};
-	xfer.dir = USB_TRANSFER_TO_DEVICE;
-	xfer.type = USB_TRANSFER_CONTROL;
-	xfer.setup = &setup;
-	xfer.buffer = NULL;
-	xfer.length = 0;
-	xfer.completion = NULL;
-
-	return usb_submit_xfer(dev, &xfer);
+	return usb_control_xfer(dev, &setup, NULL);
 }

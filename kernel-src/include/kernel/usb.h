@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <kernel/iovec.h>
 #include <list.h>
 
 typedef struct usb_hub_port usb_hub_port_t;
@@ -141,7 +142,6 @@ struct usb_hub_port {
 #define USB_HUB_FEATURE_C_PORT_RESET 20
 
 typedef struct {
-	int (*reset_port)(usb_hub_t *, uint8_t port);
 	int (*get_port_status)(usb_hub_t *, uint8_t port, uint16_t *status, uint16_t *change);
 	int (*set_port_feature)(usb_hub_t *, uint8_t port, uint16_t feature);
 	int (*clear_port_feature)(usb_hub_t *, uint8_t port, uint16_t feature);
@@ -195,14 +195,16 @@ struct usb_device {
 };
 
 typedef enum {
-	USB_TRANSFER_TO_DEVICE,
-	USB_TRANSFER_TO_HOST,
-} usb_xfer_dir_t;
+	USB_XFER_FLAG_TO_DEVICE = (1 << 0),
+	USB_XFER_FLAG_TO_HOST = (1 << 1),
+	USB_XFER_FLAG_IOVEC = (1 << 2),
+	USB_XFER_FLAG_BUFFER_PHYSICAL = (1 << 3),
+} usb_xfer_flag_t;
 
 typedef enum {
-	USB_TRANSFER_CONTROL,
-	USB_TRANSFER_BULK,
-	USB_TRANSFER_INTERRUPT,
+	USB_XFER_TYPE_CONTROL,
+	USB_XFER_TYPE_BULK,
+	USB_XFER_TYPE_INTERRUPT,
 } usb_xfer_type_t;
 
 typedef enum {
@@ -218,16 +220,21 @@ struct usb_xfer {
 	// Should be NULL and will be ignored for control transfers.
 	usb_endpoint_t *ep;
 
-	// Direction and type of the transfer.
-	usb_xfer_dir_t dir;
+	// Flags for the transfer.
+	usb_xfer_flag_t flags;
 	usb_xfer_type_t type;
 
 	// Only valid for control transfers.
 	usb_setup_t *setup;
 
 	// Buffer for the transfer.
-	void *buffer;
-	uint32_t length;
+	union {
+		iovec_iterator_t *iov;
+		struct {
+			void *data;
+			size_t data_length;
+		};
+	};
 
 	// Optional asynchronous completion callback.
 	void (*completion)(usb_xfer_t *, usb_status_t status, uint32_t transferred);
@@ -257,6 +264,8 @@ int usb_hub_enumerate(usb_hub_t *hub);
 int usb_hub_enumerate_port(usb_hub_t *hub, uint8_t port);
 
 int usb_submit_xfer(usb_device_t *dev, usb_xfer_t *xfer);
+int usb_control_xfer(usb_device_t *dev, usb_setup_t *setup, void *buffer);
+
 int usb_configure_endpoint(usb_device_t *dev, usb_endpoint_t *ep);
 int usb_get_descriptor(usb_device_t *dev, uint8_t desc_type, uint8_t desc_index, void *buffer, uint16_t length);
 int usb_set_configuration(usb_device_t *dev, uint8_t config_value);
