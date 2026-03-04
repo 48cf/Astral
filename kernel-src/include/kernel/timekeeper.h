@@ -4,6 +4,10 @@
 #include <time.h>
 #include <stdbool.h>
 
+#define CLOCK_REALTIME 0
+#define CLOCK_MONOTONIC 1
+#define CLOCK_BOOTTIME 7
+
 #define TIMEKEEPER_SOURCE_FLAGS_EARLY 1 // can be used as an early timer
 
 typedef struct {

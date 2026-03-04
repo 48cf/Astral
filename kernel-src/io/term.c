@@ -72,7 +72,7 @@ void term_init() {
 
 	// TODO add support for a background if desired by the user
 	term_ctx = flanterm_fb_init(internalalloc, noop, fb->address, fb->width, fb->height, fb->pitch,
-		fb->red_mask_size, fb->red_mask_shift, fb->green_mask_size, fb->green_mask_shift, fb->blue_mask_size, fb->blue_mask_shift, 
+		fb->red_mask_size, fb->red_mask_shift, fb->green_mask_size, fb->green_mask_shift, fb->blue_mask_size, fb->blue_mask_shift,
 		NULL, NULL, NULL, &defaultbg, &defaultfg, NULL, NULL, NULL,
 		0, 0, 1, 1, 1, 0);
 

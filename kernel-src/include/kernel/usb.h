@@ -270,6 +270,7 @@ int usb_configure_endpoint(usb_device_t *dev, usb_endpoint_t *ep);
 int usb_get_descriptor(usb_device_t *dev, uint8_t desc_type, uint8_t desc_index, void *buffer, uint16_t length);
 int usb_set_configuration(usb_device_t *dev, uint8_t config_value);
 int usb_set_interface(usb_device_t *dev, uint8_t interface_number, uint8_t alt_setting);
+int usb_get_string_descriptor(usb_device_t *dev, uint8_t index, char *buffer, size_t buffer_size);
 
 #define USB_DRIVER_SCORE_NONE 0
 #define USB_DRIVER_SCORE_GENERIC 10

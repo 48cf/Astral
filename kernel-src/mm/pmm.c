@@ -261,6 +261,12 @@ void pmm_init() {
 				pages[i].flags |= PAGE_FLAGS_FREE;
 				insertinfreelist(&pages[i]);
 			}
+		} else if (e->type == LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE) {
+			for (int i = 0; i < e->length / PAGE_SIZE; ++i) {
+				page_t *page = &pages[(e->base / PAGE_SIZE) + i];
+				page->refcount = 1;
+				page->flags &= ~PAGE_FLAGS_FREE;
+			}
 		}
 	}
 

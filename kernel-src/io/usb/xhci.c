@@ -427,49 +427,30 @@ static void xhci_handle_events(xhci_ctrl_t *xhci) {
 	xhci_trb_t *r_trb;
 
 	if ((r_trb = xhci_ring_dequeue(&xhci->event_ring)) != NULL) {
-		// Copy the event TRB so we can advance the ring dequeue pointer.
-		xhci_trb_t event_trb;
-		memcpy(&event_trb, r_trb, sizeof(xhci_trb_t));
-
-		// Update the Event Ring Dequeue Pointer.
-		uint64_t event_ring_phys = (uint64_t)xhci->event_ring.ring_phys;
-		event_ring_phys += xhci->event_ring.index * sizeof(xhci_trb_t);
-		ir->erdp = event_ring_phys | XHCI_ERDP_EHB;
-
-		uint32_t type = (event_trb.dw3 >> 10) & 0x3f;
+		uint32_t type = (r_trb->dw3 >> 10) & 0x3f;
 		if (type == TRB_COMMAND_COMPLETION_EVENT || type == TRB_XFER_COMPLETION_EVENT) {
-			uint32_t status = (event_trb.dw2 >> 24) & 0xff;
+			uint32_t status = (r_trb->dw2 >> 24) & 0xff;
 			__assert(status == TRB_SUCCESS || status == TRB_SHORT_PACKET);
 
-			xhci_submission_t *sub;
-			xhci_trb_t *trb = MAKE_HHDM(event_trb.parameters);
-
-#define IS_PART_OF_RING(RING, TRB) (void *)((uint64_t)FROM_HHDM((TRB)) & ~(PAGE_SIZE - 1UL)) == (RING)->ring_phys
-
-			if (IS_PART_OF_RING(&xhci->command_ring, trb)) {
-				xhci_ring_t *ring = &xhci->command_ring;
-				sub = &ring->submissions[trb - ring->ring];
+			xhci_ring_t *ring;
+			if (type == TRB_COMMAND_COMPLETION_EVENT) {
+				ring = &xhci->command_ring;
 			} else {
-				uint32_t slot_id = (event_trb.dw3 >> 24) & 0xff;
+				uint32_t slot_id = (r_trb->dw3 >> 24) & 0xff;
 				xhci_device_t *dev = xhci->slots[slot_id - 1];
 				__assert(dev != NULL);
 
-				xhci_ring_t *ring = NULL;
-				for (uint8_t i = 0; i < 31; i++) {
-					if (IS_PART_OF_RING(&dev->ep_rings[i], trb)) {
-						ring = &dev->ep_rings[i];
-						break;
-					}
-				}
-				__assert(ring != NULL);
-
-				sub = &ring->submissions[trb - ring->ring];
+				uint8_t ep_index = (r_trb->dw3 >> 16) & 0x1f;
+				__assert(ep_index > 0);
+				ring = &dev->ep_rings[ep_index - 1];
 			}
 
+			xhci_trb_t *trb = MAKE_HHDM(r_trb->parameters);
+			xhci_submission_t *sub = &ring->submissions[trb - ring->ring];
 			if (__atomic_exchange_n(&sub->valid, false, __ATOMIC_SEQ_CST)) {
 				__assert(sub->completion != NULL);
 
-				memcpy(&sub->event_trb, &event_trb, sizeof(xhci_trb_t));
+				memcpy(&sub->event_trb, r_trb, sizeof(xhci_trb_t));
 				memcpy(&sub->cmd_trb, trb, sizeof(xhci_trb_t));
 
 				// Invoke the completion callback.
@@ -478,6 +459,11 @@ static void xhci_handle_events(xhci_ctrl_t *xhci) {
 		} else {
 			printf("xhci: unknown event TRB type %u\n", type);
 		}
+
+		// Update the Event Ring Dequeue Pointer.
+		uint64_t event_ring_phys = (uint64_t)xhci->event_ring.ring_phys;
+		event_ring_phys += xhci->event_ring.index * sizeof(xhci_trb_t);
+		ir->erdp = event_ring_phys | XHCI_ERDP_EHB;
 	}
 
 	// Clear the interrupt pending bit.
@@ -523,8 +509,10 @@ static int xhci_ctrl_start(usb_ctrl_t *ctrl) {
 	size_t intcount;
 	if (xhci->pci_enum->msix.exists) {
 		intcount = pci_initmsix(xhci->pci_enum);
+	} else if (xhci->pci_enum->msi.exists) {
+		intcount = pci_initmsi(xhci->pci_enum, 1);
 	} else {
-		printf("xhci: controller doesn't support msi-x\n");
+		printf("xhci: controller does not support MSI or MSI-X\n");
 		return -ENODEV;
 	}
 	__assert(intcount > 0);
@@ -533,8 +521,13 @@ static int xhci_ctrl_start(usb_ctrl_t *ctrl) {
 	__assert(isr != NULL);
 	isr->priv = ctrl;
 
-	pci_msixadd(xhci->pci_enum, 0, INTERRUPT_IDTOVECTOR(isr->id), 1, 0);
-	pci_msixsetmask(xhci->pci_enum, 0);
+	if (xhci->pci_enum->msix.exists) {
+		pci_msixadd(xhci->pci_enum, 0, INTERRUPT_IDTOVECTOR(isr->id), 1, 0);
+		pci_msixsetmask(xhci->pci_enum, 0);
+	} else {
+		pci_msisetbase(xhci->pci_enum, INTERRUPT_IDTOVECTOR(isr->id), 1, 0);
+		pci_msisetmask(xhci->pci_enum, 0);
+	}
 
 	uint32_t max_slots = xhci->caps->hcsparams1 & 0xff;
 	uint32_t max_ports = (xhci->caps->hcsparams1 >> 24) & 0xff;
@@ -906,12 +899,11 @@ static void xhci_control_xfer(xhci_ctrl_t *xhci, xhci_device_t *dev, usb_xfer_t 
 	// Make sure direction matches request type and length matches buffer length.
 	usb_setup_t *setup = xfer->setup;
 
-	__assert(xfer->data_length == setup->wLength);
-
-	if (setup->bmRequestType & USB_REQUEST_DIR_TO_HOST) {
-		__assert(xfer->flags & USB_XFER_FLAG_TO_HOST);
-	} else {
-		__assert(xfer->flags & USB_XFER_FLAG_TO_DEVICE);
+	{
+		bool flags_to_host = (setup->bmRequestType & USB_REQUEST_DIR_TO_HOST) != 0;
+		bool req_to_host = (setup->bmRequestType & USB_REQUEST_DIR_TO_HOST) != 0;
+		__assert(xfer->data_length == setup->wLength);
+		__assert(flags_to_host == req_to_host);
 	}
 
 	bool has_data_stage = xfer->data != NULL && xfer->data_length > 0;
@@ -1027,7 +1019,7 @@ static void xhci_data_xfer(xhci_ctrl_t *xhci, xhci_device_t *dev, usb_xfer_t *xf
 			pmm_hold(xfer->data - page_offset);
 			trb.parameters = (uint64_t)xfer->data;
 		} else {
-			void *page = vmm_getphysical(xfer->data - page_offset, true);
+			void *page = vmm_getphysical(xfer->data - page_offset, VMM_GET_PHYSICAL_FLAGS_HOLD);
 			__assert(page != NULL);
 			trb.parameters = (uint64_t)page + page_offset;
 		}

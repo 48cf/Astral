@@ -231,3 +231,38 @@ int usb_set_interface(usb_device_t *dev, uint8_t interface_number, uint8_t alt_s
 
 	return usb_control_xfer(dev, &setup, NULL);
 }
+
+int usb_get_string_descriptor(usb_device_t *dev, uint8_t index, char *buffer, size_t buffer_size) {
+	// First, read the header to get the string length.
+	usb_desc_hdr_t hdr;
+	int res = usb_get_descriptor(dev, USB_DESCRIPTOR_TYPE_STRING, index, &hdr, sizeof(hdr));
+	if (res != 0)
+		return res;
+
+	void *temp_buf = alloc(hdr.bLength);
+	if (temp_buf == NULL)
+		return -ENOMEM;
+
+	res = usb_get_descriptor(dev, USB_DESCRIPTOR_TYPE_STRING, index, temp_buf, hdr.bLength);
+	if (res != 0) {
+		free(temp_buf);
+		return res;
+	}
+
+	// Convert UTF-16LE string to ASCII.
+	uint16_t *str_data = (uint16_t *)((uint8_t *)temp_buf + 2);
+	size_t str_len = (hdr.bLength - 2) / 2;
+
+	if (str_len >= buffer_size)
+		str_len = buffer_size - 1;
+
+	for (size_t i = 0; i < str_len; i++) {
+		uint16_t ch = str_data[i];
+		buffer[i] = (ch < 0x80) ? (char)ch : '?';
+	}
+
+	buffer[str_len] = '\0';
+
+	free(temp_buf);
+	return 0;
+}
